@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
+import type { GithubBindings } from "./github.js";
 import { ChiefError, type ChiefRegistry, type WorkspaceContext } from "./registry.js";
 
 type ProjectContext = WorkspaceContext & { projectId: string };
@@ -34,7 +35,7 @@ export interface ChiefAuthority {
   verification(context: ProjectContext, taskId: string, sequence: number): Promise<unknown>;
 }
 
-export type ChiefOperations = { registry: ChiefRegistry; authority?: ChiefAuthority };
+export type ChiefOperations = { registry: ChiefRegistry; authority?: ChiefAuthority; githubBindings?: GithubBindings };
 
 type Deps = {
   operations: ChiefOperations;
@@ -76,7 +77,8 @@ async function operatorRoute(
   const slots = path === "/api/v1/operator/chief-slots";
   const binding = /^\/api\/v1\/operator\/chief-slots\/([^/]+)\/binding$/.exec(path);
   const chief = /^\/api\/v1\/operator\/chiefs\/([^/]+)\/(ready|service-credential|identities)$/.exec(path);
-  if (!slots && !binding && !chief) return false;
+  const github = /^\/api\/v1\/operator\/workspaces\/([^/]+)\/github-binding$/.exec(path);
+  if (!slots && !binding && !chief && !github) return false;
   if (!deps.bearer(request)) {
     deps.json(response, 401, { error: "unauthorized", message: "Authentication required" }, true);
     return true;
@@ -86,11 +88,16 @@ async function operatorRoute(
     return true;
   }
   const method = request.method ?? "GET";
-  if ((binding ? method !== "GET" : method !== "POST")) {
+  if (method !== (binding ? "GET" : github ? "PUT" : "POST")) {
     deps.json(response, 405, { error: "method_not_allowed" }, true);
     return true;
   }
   await respond(response, deps.json, async () => {
+    if (github) {
+      const bindings = deps.operations.githubBindings;
+      if (!bindings) throw new ChiefError(503, "github_unavailable", "GitHub repository discovery is not configured.");
+      return { status: 200, body: await bindings.set(decodeURIComponent(github[1]!), await deps.requestObject(request)) };
+    }
     if (slots) {
       const result = await registry.registerSlot(await deps.requestObject(request));
       return { status: result.created ? 201 : 200, body: result };
