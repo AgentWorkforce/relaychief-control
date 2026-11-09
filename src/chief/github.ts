@@ -9,6 +9,10 @@ export type NangoClient = {
   get(input: GithubBinding & { endpoint: string; params: Record<string, string> }): Promise<{ data: unknown }>;
 };
 
+export type NangoGraphql = {
+  post(input: GithubBinding & { endpoint: string; body: unknown }): Promise<{ data: unknown }>;
+};
+
 const bindingSchema = z.strictObject({
   organizationId: z.string().min(1).max(500),
   connectionId: z.string().min(1).max(256),
@@ -120,26 +124,39 @@ export class NangoGithubRepositories implements RepositorySource {
 }
 
 /** Calls GitHub through Nango's proxy with the server-held secret key. */
-export function nangoClient(config: { host: string; secretKey: string }): NangoClient {
+export function nangoClient(config: { host: string; secretKey: string }): NangoClient & NangoGraphql {
+  async function send(url: URL, binding: GithubBinding, init: { method: string; body?: string; contentType?: string }) {
+    const response = await fetch(url, {
+      method: init.method,
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${config.secretKey}`,
+        "connection-id": binding.connectionId,
+        "provider-config-key": binding.providerConfigKey,
+        ...(init.contentType ? { "content-type": init.contentType } : {}),
+      },
+      ...(init.body === undefined ? {} : { body: init.body }),
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error("nango_proxy_failed");
+    }
+    return { data: await response.json() };
+  }
   return {
-    async get({ endpoint, connectionId, providerConfigKey, params }) {
+    get({ endpoint, params, ...binding }) {
       const url = new URL(`/proxy${endpoint}`, config.host);
       url.search = new URLSearchParams(params).toString();
-      const response = await fetch(url, {
-        redirect: "error",
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          accept: "application/json",
-          authorization: `Bearer ${config.secretKey}`,
-          "connection-id": connectionId,
-          "provider-config-key": providerConfigKey,
-        },
+      return send(url, binding, { method: "GET" });
+    },
+    post({ endpoint, body, ...binding }) {
+      return send(new URL(`/proxy${endpoint}`, config.host), binding, {
+        method: "POST",
+        body: JSON.stringify(body),
+        contentType: "application/json",
       });
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => {});
-        throw new Error("nango_proxy_failed");
-      }
-      return { data: await response.json() };
     },
   };
 }

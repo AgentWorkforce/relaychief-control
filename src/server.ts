@@ -2,6 +2,7 @@
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
 import { relayControlIntrospector } from "./auth/introspection.js";
+import { GithubChiefAuthority } from "./chief/authority.js";
 import { GithubBindings, NangoGithubRepositories, nangoClient } from "./chief/github.js";
 import { ChiefRegistry } from "./chief/registry.js";
 import { loadConfig } from "./config.js";
@@ -14,8 +15,10 @@ const nango = config.nango ? nangoClient(config.nango) : null;
 const repositories = nango
   ? new NangoGithubRepositories({ binding: (context) => githubBindings.get(context), nango })
   : undefined;
-// No authority yet: the evidence and verification routes answer 503 rather than
-// guessing. Without Nango, creating a chief does the same.
+const registry = new ChiefRegistry({ database, ...(repositories ? { repositories } : {}) });
+// Without Nango, creating a chief and the evidence and verification routes
+// answer 503 rather than guessing.
+const authority = nango ? new GithubChiefAuthority({ registry, bindings: githubBindings, nango }) : undefined;
 const app = createApp({
   database,
   introspect: relayControlIntrospector({
@@ -25,7 +28,7 @@ const app = createApp({
   }),
   adminToken: config.adminToken,
   browserOrigins: config.browserOrigins,
-  operations: { registry: new ChiefRegistry({ database, ...(repositories ? { repositories } : {}) }), githubBindings },
+  operations: { registry, githubBindings, ...(authority ? { authority } : {}) },
 });
 const publicServer = createServer(app.public);
 const adminServer = createServer(app.admin);

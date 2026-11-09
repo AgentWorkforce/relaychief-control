@@ -126,7 +126,7 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function digestOf(value: unknown): string {
+export function digestOf(value: unknown): string {
   return createHash("sha256").update(canonical(value)).digest("hex");
 }
 
@@ -575,6 +575,29 @@ export class ChiefRegistry implements ChiefBackend {
       throw conflict("setup_conflict", "This setup request was already used with different settings.");
     }
     return this.#view(row);
+  }
+
+  /** What the authority may read for this chief, from its own stored configuration. */
+  async chiefScope(context: WorkspaceContext & { projectId: string }) {
+    const row = await this.#tenantRow(this.#database, context, context.projectId);
+    return { repositories: row.config.repositories, maxEvidenceAgeMs: row.config.policy.maxEvidenceAgeMs };
+  }
+
+  /** The assignment as registered before it was sent, never as later reported. */
+  async assignmentFor(context: WorkspaceContext & { projectId: string }, taskId: string) {
+    const scope = await this.chiefScope(context);
+    const result = await this.#database.query<{ digest: string; assignment: unknown; created_at: Date | string }>(
+      "SELECT digest, assignment, created_at FROM chief_assignments WHERE chief_id = $1 AND task_id = $2",
+      [context.projectId, taskId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      digest: row.digest,
+      assignment: row.assignment as Record<string, unknown>,
+      assignedAt: new Date(row.created_at).getTime(),
+      repositories: scope.repositories,
+    };
   }
 
   async #tenantRow(executor: SqlExecutor, context: WorkspaceContext, id: string): Promise<ChiefRow> {
