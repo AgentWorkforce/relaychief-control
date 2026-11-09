@@ -10,7 +10,7 @@ import { open, seal } from "../src/crypto.js";
 import { ADMIN_TOKEN, startControl, tenant } from "./harness.js";
 
 const key = { id: "k1", key: randomBytes(32) };
-const RELAY_WORKSPACE = "245411583121604608";
+const RELAY_WORKSPACE = "100000000000000001";
 const workers = [{ agentId: "worker-1", address: "worker@machine", actions: ["investigate"] }];
 
 async function harness(t: test.TestContext, options: { configured?: boolean; issuer?: RelayAgentIssuer["issue"] } = {}) {
