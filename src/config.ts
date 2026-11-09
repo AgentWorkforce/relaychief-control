@@ -10,6 +10,8 @@ export type Config = {
   port: number;
   adminHost: string;
   adminPort: number;
+  /** Unset: repository discovery answers 503, so chiefs cannot be created. */
+  nango: { host: string; secretKey: string } | null;
 };
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -45,8 +47,19 @@ function port(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   return value;
 }
 
+function nango(env: NodeJS.ProcessEnv): Config["nango"] {
+  const secretKey = env.NANGO_SECRET_KEY?.trim();
+  const host = env.NANGO_HOST?.trim();
+  if (!secretKey) {
+    if (host) throw new Error("NANGO_HOST requires NANGO_SECRET_KEY");
+    return null;
+  }
+  return { host: origin(host || "https://api.nango.dev", "NANGO_HOST"), secretKey };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
+    nango: nango(env),
     databaseUrl: required(env, "DATABASE_URL"),
     relayControlUrl: origin(required(env, "RELAYCONTROL_URL"), "RELAYCONTROL_URL"),
     introspectSecret: secret(env, "RELAYCONTROL_INTROSPECT_SECRET"),
