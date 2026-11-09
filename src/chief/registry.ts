@@ -17,7 +17,8 @@ export interface RepositorySource {
 }
 
 type Worker = Record<string, unknown>;
-export type ChiefIdentities = { relayCallerId: string; workers: Worker[] };
+/** Relay names workspaces separately from Control, so `relayWorkspaceId` pins Relay's own identifier. */
+export type ChiefIdentities = { relayCallerId: string; relayWorkspaceId?: string; workers: Worker[] };
 
 /** The checks `provisionPlan()` in relay-chief names. Every one must pass. */
 export const READINESS_CHECKS = [
@@ -82,6 +83,7 @@ const readySchema = z.strictObject({
 const identitiesSchema = z
   .strictObject({
     relayCallerId: z.string().min(1).max(500),
+    relayWorkspaceId: z.string().min(1).max(500).optional(),
     workers: z
       .array(
         z.strictObject({
@@ -138,6 +140,7 @@ type ChiefConfig = {
   projectId: string;
   repositories: string[];
   relayCallerId: string;
+  relayWorkspaceId?: string;
   workers: Worker[];
   policy: {
     version: string;
@@ -392,7 +395,11 @@ export class ChiefRegistry implements ChiefBackend {
       if (!row) throw new ChiefError(404, "chief_not_found", "Chief not found.");
       if (row.state === "awaiting_capacity") throw conflict("chief_not_bound", "This chief has no slot yet.");
       const unchanged =
-        digestOf({ relayCallerId: row.config.relayCallerId, workers: row.config.workers }) === digestOf(parsed.data);
+        digestOf({
+          relayCallerId: row.config.relayCallerId,
+          ...(row.config.relayWorkspaceId ? { relayWorkspaceId: row.config.relayWorkspaceId } : {}),
+          workers: row.config.workers,
+        }) === digestOf(parsed.data);
       let config = row.config;
       if (!unchanged) {
         if (row.state === "ready") throw conflict("chief_already_ready", "A ready chief cannot change identities.");

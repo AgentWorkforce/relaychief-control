@@ -385,6 +385,25 @@ test("operator-bound identities raise the revision and unlock ready", async (t) 
   assert.equal((await h.operator(path, body)).status, 200);
 });
 
+test("identities can pin Relay's own workspace identifier", async (t) => {
+  const h = await harness(t, { bound: false });
+  await h.operator("chief-slots", { slotId: SLOT });
+  const created = await h.create(setup(["1"]));
+  const path = `chiefs/${created.body.id}/identities`;
+  const body = {
+    relayCallerId: "caller-1",
+    relayWorkspaceId: "245411583121604608",
+    workers: [{ agentId: "worker-1", address: "worker@direct", actions: ["investigate"] }],
+  };
+  const first = await h.operator(path, body);
+  assert.equal(first.status, 200);
+  const binding = await h.operator(`chief-slots/${SLOT}/binding`);
+  assert.equal(binding.body.config.relayWorkspaceId, "245411583121604608");
+  assert.equal(binding.body.config.workspaceId, h.tenant.workspaceId);
+  const repeat = await h.operator(path, body);
+  assert.equal(repeat.body.revision, first.body.revision, "an identical bind is not a new revision");
+});
+
 test("placement is opaque, and the legacy region alias replays the same request", async (t) => {
   const h = await harness(t);
   await h.operator("chief-slots", { slotId: SLOT });
