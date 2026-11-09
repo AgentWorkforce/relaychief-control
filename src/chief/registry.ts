@@ -17,6 +17,11 @@ export interface RepositorySource {
 }
 
 type Worker = Record<string, unknown>;
+
+export type RelayAgentIssuer = {
+  issue(workspaceId: string, chiefId: string): Promise<{ agentId: string; token: string; relayWorkspaceId: string }>;
+};
+export type TokenCipher = { seal(value: string): string; open(sealed: string): string };
 /** Relay names workspaces separately from Control, so `relayWorkspaceId` pins Relay's own identifier. */
 export type ChiefIdentities = { relayCallerId: string; relayWorkspaceId?: string; workers: Worker[] };
 
@@ -82,7 +87,8 @@ const readySchema = z.strictObject({
 
 const identitiesSchema = z
   .strictObject({
-    relayCallerId: z.string().min(1).max(500),
+    // Omitted: the platform registers the chief as a Relay agent at bind.
+    relayCallerId: z.string().min(1).max(500).optional(),
     relayWorkspaceId: z.string().min(1).max(500).optional(),
     workers: z
       .array(
@@ -98,7 +104,7 @@ const identitiesSchema = z
   // The same rules as relay-chief's chiefConfigSchema, so the host accepts the config.
   .refine(
     ({ relayCallerId, workers }) =>
-      !relayCallerId.startsWith(PENDING_CALLER_PREFIX) &&
+      !relayCallerId?.startsWith(PENDING_CALLER_PREFIX) &&
       new Set(workers.map((worker) => worker.agentId)).size === workers.length &&
       new Set(workers.map((worker) => worker.address)).size === workers.length &&
       !workers.some((worker) => worker.agentId === relayCallerId),
@@ -179,13 +185,19 @@ function identitiesBound(config: ChiefConfig): boolean {
 export class ChiefRegistry implements ChiefBackend {
   readonly #database: Database;
   readonly #source: RepositorySource | undefined;
+  readonly #relayAgents: RelayAgentIssuer | undefined;
+  readonly #tokenCipher: TokenCipher | undefined;
   readonly #identities: ((context: WorkspaceContext, chiefId: string) => ChiefIdentities) | undefined;
 
   constructor(options: {
     database: Database;
     repositories?: RepositorySource;
     identities?: (context: WorkspaceContext, chiefId: string) => ChiefIdentities;
+    relayAgents?: RelayAgentIssuer;
+    tokenCipher?: TokenCipher;
   }) {
+    this.#relayAgents = options.relayAgents;
+    this.#tokenCipher = options.tokenCipher;
     this.#database = options.database;
     this.#source = options.repositories;
     this.#identities = options.identities;
@@ -389,6 +401,16 @@ export class ChiefRegistry implements ChiefBackend {
   async bindIdentities(chiefId: string, raw: unknown) {
     const parsed = identitiesSchema.safeParse(raw);
     if (!parsed.success) throw new ChiefError(400, "invalid_identities", "Check the Relay caller and worker identities.");
+    // Outside the transaction: this calls relay-control. A crash after it only reissues the token on retry.
+    const registered = parsed.data.relayCallerId ? null : await this.#registerRelayAgent(chiefId);
+    const identities = {
+      ...parsed.data,
+      relayCallerId: parsed.data.relayCallerId ?? registered!.agentId,
+      ...(!parsed.data.relayWorkspaceId && registered?.relayWorkspaceId ? { relayWorkspaceId: registered.relayWorkspaceId } : {}),
+    };
+    if (parsed.data.workers.some((worker) => worker.agentId === identities.relayCallerId)) {
+      throw new ChiefError(400, "invalid_identities", "Check the Relay caller and worker identities.");
+    }
     return this.#database.transaction(async (tx) => {
       const found = await tx.query<ChiefRow>("SELECT * FROM chiefs WHERE id = $1 FOR UPDATE", [chiefId]);
       const row = found.rows[0];
@@ -399,11 +421,11 @@ export class ChiefRegistry implements ChiefBackend {
           relayCallerId: row.config.relayCallerId,
           ...(row.config.relayWorkspaceId ? { relayWorkspaceId: row.config.relayWorkspaceId } : {}),
           workers: row.config.workers,
-        }) === digestOf(parsed.data);
+        }) === digestOf(identities);
       let config = row.config;
       if (!unchanged) {
         if (row.state === "ready") throw conflict("chief_already_ready", "A ready chief cannot change identities.");
-        config = { ...row.config, ...parsed.data, revision: row.config.revision + 1 };
+        config = { ...row.config, ...identities, revision: row.config.revision + 1 };
         await tx.query("UPDATE chiefs SET config = $2::jsonb WHERE id = $1", [chiefId, JSON.stringify(config)]);
         await recordAudit(tx, {
           organizationId: row.organization_id,
@@ -413,8 +435,59 @@ export class ChiefRegistry implements ChiefBackend {
           target: chiefId,
         });
       }
+      if (registered?.ciphertext) {
+        await tx.query(
+          `INSERT INTO chief_relay_credentials (chief_id, agent_id, token_ciphertext) VALUES ($1, $2, $3)
+           ON CONFLICT (chief_id) DO UPDATE
+             SET agent_id = EXCLUDED.agent_id, token_ciphertext = EXCLUDED.token_ciphertext, updated_at = now()`,
+          [chiefId, registered.agentId, registered.ciphertext],
+        );
+        await recordAudit(tx, {
+          organizationId: row.organization_id,
+          workspaceId: row.workspace_id,
+          actor: { kind: "operator" },
+          action: "chief.relay_identity_register",
+          target: chiefId,
+        });
+      }
       return { chiefId, revision: config.revision, configurationDigest: digestOf(config) };
     });
+  }
+
+  /** Registers the chief once; a later bind reuses the stored agent rather than rotating its token. */
+  async #registerRelayAgent(chiefId: string) {
+    if (!this.#relayAgents || !this.#tokenCipher) {
+      throw new ChiefError(503, "relay_identity_unavailable", "Relay agent registration is not configured.");
+    }
+    const found = await this.#database.query<ChiefRow>("SELECT * FROM chiefs WHERE id = $1", [chiefId]);
+    const row = found.rows[0];
+    if (!row) throw new ChiefError(404, "chief_not_found", "Chief not found.");
+    if (row.state === "awaiting_capacity") throw conflict("chief_not_bound", "This chief has no slot yet.");
+    const stored = await this.#database.query<{ agent_id: string }>(
+      "SELECT agent_id FROM chief_relay_credentials WHERE chief_id = $1",
+      [chiefId],
+    );
+    if (stored.rows[0]?.agent_id === row.config.relayCallerId) {
+      return { agentId: row.config.relayCallerId, relayWorkspaceId: row.config.relayWorkspaceId, ciphertext: null };
+    }
+    if (row.state === "ready") throw conflict("chief_already_ready", "A ready chief cannot change identities.");
+    const issued = await this.#relayAgents.issue(row.workspace_id, chiefId);
+    return { agentId: issued.agentId, relayWorkspaceId: issued.relayWorkspaceId, ciphertext: this.#tokenCipher.seal(issued.token) };
+  }
+
+  /** Service: the chief's own Relay token, only while it is still the configured identity. */
+  async relayCredential(context: WorkspaceContext & { projectId: string }) {
+    const row = await this.#tenantRow(this.#database, context, context.projectId);
+    const stored = await this.#database.query<{ agent_id: string; token_ciphertext: string }>(
+      "SELECT agent_id, token_ciphertext FROM chief_relay_credentials WHERE chief_id = $1",
+      [context.projectId],
+    );
+    const credential = stored.rows[0];
+    if (!credential || credential.agent_id !== row.config.relayCallerId) {
+      throw conflict("relay_identity_unbound", "This chief has no platform-issued Relay identity.");
+    }
+    if (!this.#tokenCipher) throw new ChiefError(503, "relay_identity_unavailable", "Relay agent registration is not configured.");
+    return { agentId: credential.agent_id, token: this.#tokenCipher.open(credential.token_ciphertext) };
   }
 
   /**

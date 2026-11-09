@@ -5,6 +5,7 @@ import { relayControlIntrospector } from "./auth/introspection.js";
 import { GithubChiefAuthority } from "./chief/authority.js";
 import { GithubBindings, NangoGithubRepositories, nangoClient } from "./chief/github.js";
 import { ChiefRegistry } from "./chief/registry.js";
+import { relayControlAgentIssuer, secretCipher } from "./chief/relay-agents.js";
 import { loadConfig } from "./config.js";
 import { PostgresDatabase } from "./database.js";
 
@@ -15,7 +16,13 @@ const nango = config.nango ? nangoClient(config.nango) : null;
 const repositories = nango
   ? new NangoGithubRepositories({ binding: (context) => githubBindings.get(context), nango })
   : undefined;
-const registry = new ChiefRegistry({ database, ...(repositories ? { repositories } : {}) });
+const relayIdentity = config.relayIdentity
+  ? {
+      relayAgents: relayControlAgentIssuer({ relayControlUrl: config.relayControlUrl, secret: config.relayIdentity.secret }),
+      tokenCipher: secretCipher(config.relayIdentity.key),
+    }
+  : {};
+const registry = new ChiefRegistry({ database, ...(repositories ? { repositories } : {}), ...relayIdentity });
 // Without Nango, creating a chief and the evidence and verification routes
 // answer 503 rather than guessing.
 const authority = nango ? new GithubChiefAuthority({ registry, bindings: githubBindings, nango }) : undefined;

@@ -123,6 +123,24 @@ async function serviceRoute(
   deps: Deps,
   operations: ChiefOperations,
 ): Promise<boolean> {
+  const relay = /^\/chief\/v1\/projects\/([^/]+)\/relay-credential$/.exec(path);
+  if (relay) {
+    if ((request.method ?? "GET") !== "GET") {
+      deps.json(response, 405, { error: "method_not_allowed" }, true);
+      return true;
+    }
+    const token = deps.bearer(request);
+    if (!token) {
+      deps.json(response, 401, { error: "unauthorized", message: "Authentication required" }, true);
+      return true;
+    }
+    await respond(response, deps.json, async () => {
+      const context = await operations.registry.authenticateService(token, decodeURIComponent(relay[1]!));
+      if (!context) throw new ChiefError(401, "unauthorized", "Invalid credential for this project.");
+      return { status: 200, body: await operations.registry.relayCredential(context) };
+    });
+    return true;
+  }
   const match = /^\/chief\/v1\/projects\/([^/]+)\/(?:(evidence)|tasks\/([^/]+)\/(verification|assignment))$/.exec(path);
   if (!match) return false;
   if ((request.method ?? "GET") !== (match[4] === "assignment" ? "PUT" : "GET")) {
