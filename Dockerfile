@@ -23,9 +23,12 @@ LABEL org.opencontainers.image.source="https://github.com/AgentWorkforce/relaych
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0"
+COPY package.json package-lock.json ./
 COPY --from=build /tmp/relaychief-control-*.tgz /tmp/package.tgz
-RUN npm init -y >/dev/null \
- && npm install --omit=dev --ignore-scripts --no-audit --no-fund /tmp/package.tgz \
+# npm ci keeps production dependencies at the locked versions the build tested.
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+ && mkdir node_modules/relaychief-control \
+ && tar -xzf /tmp/package.tgz --strip-components=1 -C node_modules/relaychief-control \
  && rm /tmp/package.tgz \
  && chown -R node:node /app
 # Numeric so Kubernetes runAsNonRoot can verify it.
