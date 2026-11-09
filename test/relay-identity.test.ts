@@ -10,6 +10,7 @@ import { open, seal } from "../src/crypto.js";
 import { ADMIN_TOKEN, startControl, tenant } from "./harness.js";
 
 const key = { id: "k1", key: randomBytes(32) };
+const RELAY_WORKSPACE = "245411583121604608";
 const workers = [{ agentId: "worker-1", address: "worker@machine", actions: ["investigate"] }];
 
 async function harness(t: test.TestContext, options: { configured?: boolean; issuer?: RelayAgentIssuer["issue"] } = {}) {
@@ -18,7 +19,7 @@ async function harness(t: test.TestContext, options: { configured?: boolean; iss
   const issue: RelayAgentIssuer["issue"] = options.issuer ?? (async (workspaceId, chiefId) => {
     issued.push([workspaceId, chiefId]);
     count += 1;
-    return { agentId: "agent-1", token: `relay-token-${count}`, relayWorkspaceId: "relay-ws" };
+    return { agentId: "agent-1", token: `relay-token-${count}`, relayWorkspaceId: RELAY_WORKSPACE };
   });
   const app = await startControl({
     operations: (database) => ({
@@ -55,7 +56,11 @@ test("binding without a caller registers the agent and the slot can fetch its to
   assert.deepEqual(h.issued, [[tenant.workspaceId, h.id]]);
   const config = await h.config();
   assert.equal(config.relayCallerId, "agent-1");
-  assert.equal(config.relayWorkspaceId, "relay-ws");
+  // Relay names its workspace differently from Control, and a chief refuses to run on a mismatch.
+  assert.notEqual(RELAY_WORKSPACE, tenant.workspaceId);
+  assert.equal(config.relayWorkspaceId, RELAY_WORKSPACE);
+  assert.equal(config.workspaceId, tenant.workspaceId);
+  assert.equal(config.revision, 2);
   const fetched = await h.fetchRelay();
   assert.equal(fetched.status, 200, fetched.text);
   assert.deepEqual(fetched.body, { agentId: "agent-1", token: "relay-token-1" });
