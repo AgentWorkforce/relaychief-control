@@ -118,14 +118,19 @@ test("concurrent requests for one repository leave exactly one chief", { skip },
   await invariants();
 });
 
-test("slots registered during concurrent creates leave no free slot beside a waiting chief", { skip }, async (t) => {
+test("a slot and a chief arriving together are always matched", { skip }, async (t) => {
   const { registry, count, invariants } = await fixture(t);
-  await settled<unknown>([
-    ...range(20).map((n) => registry.create(context, setup([String(n)]))),
-    ...range(8).map((n) => registry.registerSlot({ slotId: `slot-0000000${n}` })),
-  ]);
-  assert.equal(await count("FROM chief_slots"), 8);
-  assert.equal(await count("FROM chief_slots WHERE state = 'assigned'"), 8);
-  assert.equal(await count("FROM chiefs WHERE state = 'awaiting_capacity'"), 12);
+  const jitter = () => new Promise((resolve) => setTimeout(resolve, Math.random() * 4));
+  // Without the assignment lock, each transaction misses the other's uncommitted
+  // row and leaves a free slot beside a waiting chief. Row locks do not cover it.
+  for (const round of range(40)) {
+    await settled<unknown>([
+      jitter().then(() => registry.create(context, setup([String(round)]))),
+      jitter().then(() => registry.registerSlot({ slotId: `slot-${String(round).padStart(8, "0")}` })),
+    ]);
+    assert.equal(await count("FROM chief_slots WHERE state = 'free'"), 0, `round ${round} left a free slot`);
+    assert.equal(await count("FROM chiefs WHERE state = 'awaiting_capacity'"), 0, `round ${round} left a chief waiting`);
+  }
+  assert.equal(await count("FROM chief_slots WHERE state = 'assigned'"), 40);
   await invariants();
 });
