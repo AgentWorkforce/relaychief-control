@@ -1,3 +1,5 @@
+import type { SecretKey } from "./crypto.js";
+
 export type Config = {
   databaseUrl: string;
   relayControlUrl: string;
@@ -12,6 +14,8 @@ export type Config = {
   adminPort: number;
   /** Unset: repository discovery answers 503, so chiefs cannot be created. */
   nango: { host: string; secretKey: string } | null;
+  /** Unset: a chief must be bound with an explicit relayCallerId. */
+  relayIdentity: { secret: string; key: SecretKey } | null;
 };
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -57,8 +61,19 @@ function nango(env: NodeJS.ProcessEnv): Config["nango"] {
   return { host: origin(host || "https://api.nango.dev", "NANGO_HOST"), secretKey };
 }
 
+function relayIdentity(env: NodeJS.ProcessEnv): Config["relayIdentity"] {
+  const names = ["RELAYCHIEF_CONTROL_RELAY_SECRET", "RELAYCHIEF_CONTROL_ENCRYPTION_KEY_ID", "RELAYCHIEF_CONTROL_ENCRYPTION_KEY"];
+  if (!names.some((name) => env[name]?.trim())) return null;
+  const hex = required(env, "RELAYCHIEF_CONTROL_ENCRYPTION_KEY");
+  if (!/^[a-f0-9]{64}$/i.test(hex)) throw new Error("RELAYCHIEF_CONTROL_ENCRYPTION_KEY must be 64 hex characters");
+  const id = required(env, "RELAYCHIEF_CONTROL_ENCRYPTION_KEY_ID");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error("RELAYCHIEF_CONTROL_ENCRYPTION_KEY_ID must be 1-64 URL-safe characters");
+  return { secret: secret(env, "RELAYCHIEF_CONTROL_RELAY_SECRET"), key: { id, key: Buffer.from(hex, "hex") } };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
+    relayIdentity: relayIdentity(env),
     nango: nango(env),
     databaseUrl: required(env, "DATABASE_URL"),
     relayControlUrl: origin(required(env, "RELAYCONTROL_URL"), "RELAYCONTROL_URL"),
