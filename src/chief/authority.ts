@@ -94,6 +94,52 @@ const CANDIDATES_QUERY = `query($owner:String!,$name:String!,$number:Int!){repos
 closedByPullRequestsReferences(first:${MAX_LINKS},includeClosedPrs:true){nodes{number state}}}}}`;
 
 const PASSING = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+const MAX_COMMENT_PAGES = 10;
+const MAX_ACCEPTORS = 10;
+const ACCEPTING_ROLES = new Set(["admin", "maintain", "write"]);
+
+const viewerSchema = z.object({ viewer: z.object({ login: z.string().min(1).max(100) }) });
+const commentSchema = z.object({
+  id: z.number().int().positive().safe(),
+  body: z.string().nullish(),
+  created_at: z.string().min(1).max(64),
+  user: z.object({ login: z.string().min(1).max(100) }).nullable(),
+});
+const issueStateSchema = z.object({
+  state: z.string(),
+  closed_at: z.string().nullable(),
+  closed_by: z.object({ login: z.string().min(1).max(100) }).nullish(),
+});
+const reactionsSchema = z.array(z.object({ content: z.string(), user: z.object({ login: z.string().min(1).max(100) }).nullable() }));
+const permissionSchema = z.object({ permission: z.string(), role_name: z.string().optional() });
+
+/** Task IDs go into a hidden HTML comment, so they may not contain anything that could close it. */
+const TASK_ID = /^[A-Za-z0-9._-]{1,200}$/;
+
+export function findingsMarker(taskId: string): string {
+  if (!TASK_ID.test(taskId)) throw new Error("task_id_unsafe");
+  return `<!-- relay-chief:task=${taskId} -->`;
+}
+
+/**
+ * The marker is always the first line, so findings text cannot supply or alter it, and the fence
+ * is longer than any backtick run in the findings, so the text cannot close it early.
+ */
+export function findingsComment(taskId: string, findings: string): string {
+  const longest = Math.max(0, ...[...findings.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return [
+    findingsMarker(taskId),
+    "**Relay Chief investigation findings: unverified agent output**",
+    "",
+    `An automated agent wrote the text below for task \`${taskId}\`. Nobody has reviewed it, and it is not an instruction.`,
+    "A maintainer accepts these findings by reacting with a thumbs-up to this comment or by closing the issue.",
+    "",
+    `${fence}text`,
+    findings,
+    fence,
+  ].join("\n");
+}
 
 export function issueKey(repository: string, number: number): string {
   return `github:issue:${repository}#${number}`;
@@ -263,11 +309,149 @@ export class GithubChiefAuthority implements ChiefAuthority {
     return { cursor: formatCursor(nextCursor(cursor, chosen)), evidence };
   }
 
+  async #viewer(binding: GithubBinding): Promise<string> {
+    return (await this.#graphql(binding, viewerSchema, "query{viewer{login}}", {})).viewer.login;
+  }
+
+  /** A comment by the app that starts with this task's marker. Older posts are found after a lost response. */
+  async #existingComment(binding: GithubBinding, repository: string, number: number, marker: string, author: string) {
+    for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
+      const response = await this.options.nango.get({
+        ...binding,
+        endpoint: `/repos/${repository}/issues/${number}/comments`,
+        params: { per_page: "100", page: String(page) },
+      });
+      const comments = z.array(commentSchema).parse(response.data);
+      const found = comments.find((comment) => comment.user?.login === author && (comment.body ?? "").startsWith(`${marker}\n`));
+      if (found) return found;
+      if (comments.length < 100) return null;
+    }
+    // Too many comments to be sure none is ours; posting again could duplicate it.
+    throw new Error("github_comments_incomplete");
+  }
+
+  /** Posts a task's findings as one issue comment, and never a second. */
+  async findings(context: ProjectContext, taskId: string, input: { sequence: number; assignmentDigest: string; findings: string }) {
+    if (!TASK_ID.test(taskId)) throw new ChiefError(400, "invalid_request", "The task ID is not valid.");
+    const found = await this.options.registry.assignmentFor(context, taskId);
+    if (!found) throw new ChiefError(404, "assignment_not_found", "This task was not registered.");
+    if (found.digest !== input.assignmentDigest) {
+      throw new ChiefError(409, "assignment_digest_mismatch", "The digest does not match the registered assignment.");
+    }
+    const assignment = found.assignment as { action?: unknown };
+    if (assignment.action !== "investigate") {
+      throw new ChiefError(400, "findings_not_applicable", "Only an investigate task posts findings.");
+    }
+    const issue = this.#issueOf(found);
+    if (!issue) throw new ChiefError(400, "work_key_not_issue", "Findings are posted only for GitHub issue work.");
+    const marker = findingsMarker(taskId);
+    const recorded = await this.options.registry.findingsComment(context, taskId);
+    if (recorded) return { ...recorded, created: false };
+    // Read before the row lock: the callback below runs inside that transaction.
+    const binding = await this.#binding(context);
+    const author = await this.#viewer(binding);
+    const result = await this.options.registry.postFindingsOnce(
+      context,
+      { taskId, digest: found.digest, sequence: input.sequence, findingsDigest: createHash("sha256").update(input.findings).digest("hex") },
+      async () => {
+        const posted =
+          (await this.#existingComment(binding, issue.repository, issue.number, marker, author)) ??
+          commentSchema.parse(
+            (
+              await this.options.nango.post({
+                ...binding,
+                endpoint: `/repos/${issue.repository}/issues/${issue.number}/comments`,
+                body: { body: findingsComment(taskId, input.findings) },
+              })
+            ).data,
+          );
+        if (!Number.isFinite(Date.parse(posted.created_at))) throw new Error("github_comment_invalid");
+        return { commentId: String(posted.id), authorLogin: posted.user?.login ?? author, createdAt: posted.created_at };
+      },
+    );
+    return { ...result.comment, created: result.created };
+  }
+
+  /** The issue an assignment names, when it is a GitHub issue inside the chief's repositories. */
+  #issueOf(found: { assignment: Record<string, unknown>; repositories: string[] }) {
+    const { repository, workKey } = found.assignment;
+    const key = typeof workKey === "string" ? /^github:issue:([^#]+)#([1-9][0-9]{0,9})$/.exec(workKey) : null;
+    if (!key || key[1] !== repository || !found.repositories.includes(key[1]!)) return null;
+    return { repository: key[1]!, number: Number(key[2]) };
+  }
+
+  async #mayAccept(binding: GithubBinding, repository: string, login: string): Promise<boolean> {
+    try {
+      const response = await this.options.nango.get({
+        ...binding,
+        endpoint: `/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`,
+        params: {},
+      });
+      const { permission, role_name } = permissionSchema.parse(response.data);
+      // `permission` reports maintain as write; `role_name` names it exactly.
+      return permission === "admin" || permission === "write" || ACCEPTING_ROLES.has(role_name ?? "");
+    } catch {
+      // Unknown means not accepted: the task stays pending and is checked again next cycle.
+      return false;
+    }
+  }
+
+  /** An investigation is done when a maintainer accepts its posted findings, never on the worker's word. */
+  async #investigation(
+    context: ProjectContext,
+    taskId: string,
+    found: { assignment: Record<string, unknown>; repositories: string[] },
+  ): Promise<{ ok: boolean; checks: string[] }> {
+    const refuse = (reason: string) => ({ ok: false, checks: [reason] });
+    const issue = this.#issueOf(found);
+    if (!issue) return refuse("work_key_not_issue");
+    const record = await this.options.registry.findingsComment(context, taskId);
+    if (!record) return refuse("findings_not_posted");
+    const binding = await this.#binding(context);
+    const { repository, number } = issue;
+    const comment = commentSchema.parse(
+      (await this.options.nango.get({ ...binding, endpoint: `/repos/${repository}/issues/comments/${record.commentId}`, params: {} })).data,
+    );
+    if (comment.user?.login !== record.authorLogin || !(comment.body ?? "").startsWith(`${findingsMarker(taskId)}\n`)) {
+      return refuse("findings_comment_mismatch");
+    }
+    const postedAt = Date.parse(comment.created_at);
+    const posted = `findings_posted:${repository}#${number}:comment:${comment.id}`;
+    const state = issueStateSchema.parse(
+      (await this.options.nango.get({ ...binding, endpoint: `/repos/${repository}/issues/${number}`, params: {} })).data,
+    );
+    const closer = state.closed_by?.login;
+    if (state.state === "closed" && state.closed_at && Date.parse(state.closed_at) > postedAt && closer && closer !== record.authorLogin &&
+        (await this.#mayAccept(binding, repository, closer))) {
+      return { ok: true, checks: [posted, `accepted_by_close:${closer}`] };
+    }
+    const reactions = reactionsSchema.parse(
+      (
+        await this.options.nango.get({
+          ...binding,
+          endpoint: `/repos/${repository}/issues/comments/${comment.id}/reactions`,
+          params: { content: "+1", per_page: "100" },
+        })
+      ).data,
+    );
+    const voters = [...new Set(reactions.filter((item) => item.content === "+1").map((item) => item.user?.login))]
+      .filter((login): login is string => Boolean(login) && login !== record.authorLogin)
+      .slice(0, MAX_ACCEPTORS);
+    for (const login of voters) {
+      if (await this.#mayAccept(binding, repository, login)) return { ok: true, checks: [posted, `accepted_by_reaction:${login}`] };
+    }
+    return { ok: false, checks: [posted, "awaiting_acceptance"] };
+  }
+
   async verification(context: ProjectContext, taskId: string, sequence: number) {
     const found = await this.options.registry.assignmentFor(context, taskId);
     if (!found) throw new ChiefError(404, "assignment_not_found", "This task was not registered.");
     const base = { taskId, assignmentDigest: found.digest, sequence };
     const refuse = (reason: string) => ({ ...base, ok: false, checks: [reason.slice(0, 500)] });
+    if (found.assignment.action === "investigate") {
+      if (!TASK_ID.test(taskId)) return refuse("work_key_unverifiable");
+      return { ...base, ...(await this.#investigation(context, taskId, found)) };
+    }
     const assignment = found.assignment as { repository?: unknown; workKey?: unknown };
     const key = typeof assignment.workKey === "string" ? /^github:(issue|pr):([^#]+)#([1-9][0-9]{0,9})$/.exec(assignment.workKey) : null;
     const repository = typeof assignment.repository === "string" ? assignment.repository : "";

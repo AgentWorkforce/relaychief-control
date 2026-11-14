@@ -25,6 +25,11 @@ const verificationSchema = z.strictObject({
   ok: z.boolean(),
   checks: z.array(z.string().min(1).max(500)).max(100),
 });
+const findingsSchema = z.strictObject({
+  sequence: z.number().int().positive().safe(),
+  assignmentDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  findings: z.string().min(1).max(3_000),
+});
 
 /**
  * Supplies evidence and independent verification. Without an authority both routes refuse. Implementations own project authorization, redaction and
@@ -33,6 +38,12 @@ const verificationSchema = z.strictObject({
 export interface ChiefAuthority {
   evidence(context: ProjectContext, page: { limit: number; cursor?: string }): Promise<unknown>;
   verification(context: ProjectContext, taskId: string, sequence: number): Promise<unknown>;
+  /** Posts an investigation's findings where a maintainer can accept them. Idempotent per task. */
+  findings?(
+    context: ProjectContext,
+    taskId: string,
+    input: z.infer<typeof findingsSchema>,
+  ): Promise<{ created: boolean } & Record<string, unknown>>;
 }
 
 export type ChiefOperations = { registry: ChiefRegistry; authority?: ChiefAuthority; githubBindings?: GithubBindings };
@@ -141,9 +152,9 @@ async function serviceRoute(
     });
     return true;
   }
-  const match = /^\/chief\/v1\/projects\/([^/]+)\/(?:(evidence)|tasks\/([^/]+)\/(verification|assignment))$/.exec(path);
+  const match = /^\/chief\/v1\/projects\/([^/]+)\/(?:(evidence)|tasks\/([^/]+)\/(verification|assignment|findings))$/.exec(path);
   if (!match) return false;
-  if ((request.method ?? "GET") !== (match[4] === "assignment" ? "PUT" : "GET")) {
+  if ((request.method ?? "GET") !== (match[4] === "assignment" || match[4] === "findings" ? "PUT" : "GET")) {
     deps.json(response, 405, { error: "method_not_allowed" }, true);
     return true;
   }
@@ -164,6 +175,13 @@ async function serviceRoute(
         decodeURIComponent(match[3]!),
         await deps.requestObject(request),
       );
+      return { status: result.created ? 201 : 200, body: result };
+    }
+    if (match[4] === "findings") {
+      const input = findingsSchema.safeParse(await deps.requestObject(request));
+      if (!input.success) throw new ChiefError(400, "invalid_findings", "Send sequence, assignmentDigest and 1-3000 characters of findings.");
+      if (!operations.authority?.findings) throw unavailable();
+      const result = await operations.authority.findings(context, decodeURIComponent(match[3]!), input.data);
       return { status: result.created ? 201 : 200, body: result };
     }
     return {
