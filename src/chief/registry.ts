@@ -173,6 +173,36 @@ type ChiefRow = {
   created_at: Date | string;
 };
 
+type FindingsRow = {
+  task_id: string;
+  digest: string;
+  sequence: number;
+  comment_id: string | null;
+  author_login: string | null;
+  comment_created_at: Date | string | null;
+  posted_at: Date | string | null;
+};
+export type FindingsComment = {
+  taskId: string;
+  assignmentDigest: string;
+  sequence: number;
+  commentId: string;
+  authorLogin: string;
+  commentCreatedAt: string;
+  postedAt: string;
+};
+function findingsView(row: FindingsRow): FindingsComment {
+  return {
+    taskId: row.task_id,
+    assignmentDigest: row.digest,
+    sequence: Number(row.sequence),
+    commentId: row.comment_id!,
+    authorLogin: row.author_login!,
+    commentCreatedAt: new Date(row.comment_created_at!).toISOString(),
+    postedAt: new Date(row.posted_at!).toISOString(),
+  };
+}
+
 function conflict(code: string, message: string): ChiefError {
   return new ChiefError(409, code, message);
 }
@@ -678,6 +708,51 @@ export class ChiefRegistry implements ChiefBackend {
       assignedAt: new Date(row.created_at).getTime(),
       repositories: scope.repositories,
     };
+  }
+
+  /** The findings comment posted for a task, or null when none is recorded yet. */
+  async findingsComment(context: WorkspaceContext & { projectId: string }, taskId: string): Promise<FindingsComment | null> {
+    await this.#tenantRow(this.#database, context, context.projectId);
+    const result = await this.#database.query<FindingsRow>(
+      "SELECT * FROM chief_findings WHERE chief_id = $1 AND task_id = $2 AND comment_id IS NOT NULL",
+      [context.projectId, taskId],
+    );
+    return result.rows[0] ? findingsView(result.rows[0]) : null;
+  }
+
+  /**
+   * Posts a task's findings at most once. The row is held for the whole call,
+   * so a concurrent request waits and then sees the recorded comment.
+   */
+  async postFindingsOnce(
+    context: WorkspaceContext & { projectId: string },
+    claim: { taskId: string; digest: string; sequence: number; findingsDigest: string },
+    post: () => Promise<{ commentId: string; authorLogin: string; createdAt: string }>,
+  ): Promise<{ created: boolean; comment: FindingsComment }> {
+    await this.#tenantRow(this.#database, context, context.projectId);
+    return this.#database.transaction(async (tx) => {
+      await tx.query(
+        `INSERT INTO chief_findings (chief_id, task_id, digest, sequence, findings_digest)
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
+        [context.projectId, claim.taskId, claim.digest, claim.sequence, claim.findingsDigest],
+      );
+      const held = await tx.query<FindingsRow>(
+        "SELECT * FROM chief_findings WHERE chief_id = $1 AND task_id = $2 FOR UPDATE",
+        [context.projectId, claim.taskId],
+      );
+      const row = held.rows[0];
+      if (row?.comment_id) return { created: false, comment: findingsView(row) };
+      const posted = await post();
+      const saved = await tx.query<FindingsRow>(
+        `UPDATE chief_findings
+            SET comment_id = $3, author_login = $4, comment_created_at = $5, posted_at = now(),
+                sequence = $6, findings_digest = $7
+          WHERE chief_id = $1 AND task_id = $2
+          RETURNING *`,
+        [context.projectId, claim.taskId, posted.commentId, posted.authorLogin, posted.createdAt, claim.sequence, claim.findingsDigest],
+      );
+      return { created: true, comment: findingsView(saved.rows[0]!) };
+    });
   }
 
   async #tenantRow(executor: SqlExecutor, context: WorkspaceContext, id: string): Promise<ChiefRow> {
