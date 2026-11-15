@@ -1,0 +1,131 @@
+# Fast path: check and publish the relaychief-control image on Blacksmith
+# runners, outside the shared GitHub-hosted queue. Anyone with write access
+# (people or agents) may start it; nothing runs until Khaliq approves the
+# fast-path environment.
+#
+# It runs the same checks as CI (typecheck, tests against Postgres 16, build)
+# and pushes a linux/amd64+linux/arm64 build to
+# ghcr.io/agentworkforce/relaychief-control tagged fast-<sha> only. It never
+# moves or claims a release tag: no :latest, :main, semver or sha-<sha> (the
+# release workflow refuses to overwrite sha-<sha>, so the fast path leaves it
+# free). It refuses to overwrite an existing fast-<sha>, since the release
+# workflow accepts fast-* as a release tag. Pin the digest printed in the run
+# summary.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a PR branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+# run_id keeps a run that waits for approval from displacing (cancelling) another
+# pending dispatch of the same ref.
+concurrency:
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/agentworkforce/relaychief-control
+jobs:
+  test:
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+      - run: npm run build
+
+  image:
+    needs: test
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse an existing fast tag
+        env:
+          SHA: ${{ needs.test.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The release workflow accepts any unreserved tag, fast-* included, so
+          # never overwrite an existing tag: pin the digest it already names.
+          out="$RUNNER_TEMP/imagetools-fast.txt"
+          if docker buildx imagetools inspect "$IMAGE:fast-$SHA" >"$out" 2>&1; then
+            echo "::error::$IMAGE:fast-$SHA already exists; pin its digest instead of republishing."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$out"; then
+            cat "$out" >&2
+            echo "::error::Could not prove $IMAGE:fast-$SHA is absent; failing closed."
+            exit 1
+          fi
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:fast-${{ needs.test.outputs.sha }}
+          build-args: |
+            IMAGE_REVISION=${{ needs.test.outputs.sha }}
+            IMAGE_VERSION=fast-${{ needs.test.outputs.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.test.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### relaychief-control fast path"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- image: \`${IMAGE}@${DIGEST}\` (tag fast-$SHA)"
+          } >> "$GITHUB_STEP_SUMMARY"
