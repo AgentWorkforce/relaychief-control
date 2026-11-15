@@ -8,7 +8,9 @@
 # ghcr.io/agentworkforce/relaychief-control tagged fast-<sha> only. It never
 # moves or claims a release tag: no :latest, :main, semver or sha-<sha> (the
 # release workflow refuses to overwrite sha-<sha>, so the fast path leaves it
-# free). Pin the digest printed in the run summary.
+# free). It refuses to overwrite an existing fast-<sha>, since the release
+# workflow accepts fast-* as a release tag. Pin the digest printed in the run
+# summary.
 name: fast-path
 run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
 on:
@@ -83,6 +85,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse an existing fast tag
+        env:
+          SHA: ${{ needs.test.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The release workflow accepts any unreserved tag, fast-* included, so
+          # never overwrite an existing tag: pin the digest it already names.
+          out="$RUNNER_TEMP/imagetools-fast.txt"
+          if docker buildx imagetools inspect "$IMAGE:fast-$SHA" >"$out" 2>&1; then
+            echo "::error::$IMAGE:fast-$SHA already exists; pin its digest instead of republishing."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$out"; then
+            cat "$out" >&2
+            echo "::error::Could not prove $IMAGE:fast-$SHA is absent; failing closed."
+            exit 1
+          fi
       - id: build
         uses: docker/build-push-action@v6
         with:
